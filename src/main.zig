@@ -12,21 +12,26 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const address = try net.Address.resolveIp(HOST, PORT);
-    const conn = try net.tcpConnectToAddress(address);
-    defer conn.close();
+    // The networking stack is now contained within the Client struct.
+    // We only need to resolve the address and create a connection manager.
 
-    // 1. Prepare the HTTP Client and Request
-    var client = http.Client.init(.{ .allocator = allocator, .connection = conn });
+    // 1. Resolve Address and Prepare Connection
+    // The `resolveIp` function takes the allocator as its first argument in recent Zig versions
+    const address = try net.Address.resolveIp(allocator, HOST, PORT);
+    var conn_mgr = net.tcp.ConnectionManager.init(allocator, address);
+
+    // 2. Prepare the HTTP Client and Request
+    // FIX: Initialize http.Client using struct literal instead of .init()
+    var client = http.Client{
+        .allocator = allocator,
+        .connection_manager = &conn_mgr,
+        .connection_timeout = null, // Use default or set a timeout
+    };
     defer client.deinit();
 
-    const request = try client.request(.{
-        .method = .POST,
-        .uri = PATH,
-        .host = HOST,
-        .port = PORT,
-    });
-    defer request.deinit();
+    // Use a full URI for clarity and compliance with the client request method
+    const uri = try std.Uri.parse(try std.fmt.allocPrint(allocator, "http://{s}:{d}{s}", .{ HOST, PORT, PATH }));
+    defer allocator.free(uri.host); // Free the allocated URI string
 
     // The JSON payload to send
     const payload =
@@ -37,38 +42,43 @@ pub fn main() !void {
         \\}
     ;
 
-    // 2. Set Headers
-    // Authorization header
-    try request.setHeader("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{API_TOKEN}));
-    // Content-Type header
-    try request.setHeader("Content-Type", "application/json");
+    // 3. Set Headers
+    // Authorization header value is prepared here
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{API_TOKEN});
+    defer allocator.free(auth_header);
 
-    // 3. Send Request and Payload
-    try request.send();
-    const writer = request.transfer.writer();
-    try writer.writeAll(payload);
-    try request.finish();
+    const headers = [_]http.Header{
+        .{ .name = "Authorization", .value = auth_header },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
 
-    // 4. Read Response
-    const response = try request.response();
+    // 4. Send Request and Payload
+    var request = try client.request(.POST, uri, .{
+        .extra_headers = &headers,
+    });
+    defer request.deinit();
 
-    std.debug.print("Response Status: {s}\n", .{@tagName(response.status)});
+    // Send the payload
+    try request.sendBodyComplete(payload);
 
-    if (response.status == .ok) {
+    // 5. Read Response
+    var buffer: [1024]u8 = undefined;
+    var response = try request.receiveHead(&buffer);
+
+    std.debug.print("Response Status: {s}\n", .{@tagName(response.head.status)});
+
+    if (response.head.status == .ok) {
         std.debug.print("Response Headers:\n", .{});
-        while (try response.getHeaders().next()) |header| {
-            std.debug.print("- {s}: {s}\n", .{ header.name, header.value });
-        }
+        const reader = response.reader(.{});
 
         // Read the response body
         std.debug.print("\nResponse Body:\n", .{});
-        var buffer: [1024]u8 = undefined;
-        const reader = response.transfer.reader();
-        while (reader.read(buffer[0..])) |len| {
-            std.debug.print("{s}", .{buffer[0..len]});
-        }
+
+        const body_bytes = try reader.allocRemaining(allocator, .unlimited);
+        defer allocator.free(body_bytes);
+        std.debug.print("{s}", .{body_bytes});
         std.debug.print("\n", .{});
     } else {
-        std.debug.print("HTTP Error: {s}\n", .{@tagName(response.status)});
+        std.debug.print("HTTP Error: {s}\n", .{@tagName(response.head.status)});
     }
 }
