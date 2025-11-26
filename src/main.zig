@@ -1,27 +1,74 @@
 const std = @import("std");
-const notify_africa_zig = @import("notify_africa_zig");
+const net = std.net;
+const http = std.http;
+
+const API_TOKEN = "your-api-token-here"; // <<< REPLACE THIS!
+const HOST = "localhost";
+const PORT = 3000;
+const PATH = "/api/v1/api/messages/send";
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try notify_africa_zig.bufferedPrint();
-}
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    const address = try net.Address.resolveIp(HOST, PORT);
+    const conn = try net.tcpConnectToAddress(address);
+    defer conn.close();
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
+    // 1. Prepare the HTTP Client and Request
+    var client = http.Client.init(.{ .allocator = allocator, .connection = conn });
+    defer client.deinit();
+
+    const request = try client.request(.{
+        .method = .POST,
+        .uri = PATH,
+        .host = HOST,
+        .port = PORT,
+    });
+    defer request.deinit();
+
+    // The JSON payload to send
+    const payload =
+        \\{
+        \\    "phone_number": "255689737459",
+        \\    "message": "Hello from API Management endpoint!",
+        \\    "sender_id": "137"
+        \\}
+    ;
+
+    // 2. Set Headers
+    // Authorization header
+    try request.setHeader("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{API_TOKEN}));
+    // Content-Type header
+    try request.setHeader("Content-Type", "application/json");
+
+    // 3. Send Request and Payload
+    try request.send();
+    const writer = request.transfer.writer();
+    try writer.writeAll(payload);
+    try request.finish();
+
+    // 4. Read Response
+    const response = try request.response();
+
+    std.debug.print("Response Status: {s}\n", .{@tagName(response.status)});
+
+    if (response.status == .ok) {
+        std.debug.print("Response Headers:\n", .{});
+        while (try response.getHeaders().next()) |header| {
+            std.debug.print("- {s}: {s}\n", .{ header.name, header.value });
         }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+
+        // Read the response body
+        std.debug.print("\nResponse Body:\n", .{});
+        var buffer: [1024]u8 = undefined;
+        const reader = response.transfer.reader();
+        while (reader.read(buffer[0..])) |len| {
+            std.debug.print("{s}", .{buffer[0..len]});
+        }
+        std.debug.print("\n", .{});
+    } else {
+        std.debug.print("HTTP Error: {s}\n", .{@tagName(response.status)});
+    }
 }
